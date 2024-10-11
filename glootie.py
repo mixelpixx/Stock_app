@@ -8,7 +8,7 @@ from py_vollib.black_scholes.greeks.analytical import delta, gamma, vega, theta
 from datetime import datetime, timedelta
 import logging
 import plotly.graph_objects as go
-from openai import OpenAI
+import openai
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -18,20 +18,73 @@ load_dotenv()
 logging.basicConfig(filename='stock_app_error.log', level=logging.ERROR,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# Set up OpenAI API key
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def search_stock_symbol(query):
+def search_stock_symbol(company_name):
     try:
-        tickers = yf.Ticker(query)
-        if hasattr(tickers, 'info') and tickers.info:
-            return tickers.info['symbol']
-        else:
-            return None
+        ticker = yf.Ticker(company_name)
+        return ticker.ticker
     except Exception as e:
         logging.error(f"Error searching stock symbol: {e}")
         return None
 
+st.set_page_config(page_title="Stock Analysis App", layout="wide")
+
+st.title("Stock Analysis Application")
+
+# Sidebar for API key and general settings
+with st.sidebar:
+    st.header("Settings")
+    polygon_api_key = st.text_input("Polygon API Key", type="password")
+    
+    # Radio buttons for date range selection
+    date_range = st.radio(
+        "Select Date Range",
+        ["1 Day", "3 Days", "1 Month", "3 Months", "1 Year"]
+    )
+
+    # Add timeframe selection for graph resolution
+    timeframe = st.selectbox(
+        "Select Timeframe for Graph",
+        ["1 Minute", "5 Minutes", "15 Minutes", "30 Minutes", "1 Hour", "1 Day"]
+    )
+
+    # Calculate the date range based on selection
+    end_date = datetime.now()
+    if date_range == "1 Day":
+        start_date = end_date - timedelta(days=1)
+    elif date_range == "3 Days":
+        start_date = end_date - timedelta(days=3)
+    elif date_range == "1 Month":
+        start_date = end_date - timedelta(days=30)
+    elif date_range == "3 Months":
+        start_date = end_date - timedelta(days=90)
+    else:  # 1 Year
+        start_date = end_date - timedelta(days=365)
+
+# Main content area
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Stock Search")
+    company_name = st.text_input("Enter company name to search for symbol")
+    if st.button("Search Symbol"):
+        if company_name:
+            symbol = search_stock_symbol(company_name)
+            if symbol:
+                st.success(f"Symbol for {company_name}: {symbol}")
+            else:
+                st.error(f"Could not find symbol for {company_name}")
+
+with col2:
+    st.subheader("Stock Analysis")
+    symbol = st.text_input("Enter a stock symbol", "AAPL")
+
+# Initialize Polygon client
+client = RESTClient(polygon_api_key)
+
+# Function to get stock details
 def get_stock_details(symbol):
     try:
         ticker = yf.Ticker(symbol)
@@ -40,11 +93,15 @@ def get_stock_details(symbol):
             return info
         st.warning(f"No details found for symbol: {symbol}")
         return None
+    except polygon_exceptions.NoResultsError:
+        st.warning(f"No details found for symbol: {symbol}")
+        return None
     except Exception as e:
         logging.error(f"Error fetching stock details: {e}")
         st.error(f"Error fetching stock details: {str(e)}")
         return None
 
+# Function to get option Greeks
 def get_option_greeks(symbol):
     try:
         ticker = yf.Ticker(symbol)
@@ -71,7 +128,43 @@ def get_option_greeks(symbol):
         logging.error(f"Error fetching option Greeks: {e}")
         return None
 
-def get_current_quote(symbol, client):
+def format_stock_data_for_chatgpt(symbol, details, quote, historical_data, greeks):
+    prompt = f"""
+    Analyze the following stock data for {symbol}:
+
+    Stock Details:
+    - Name: {details.get('longName', 'N/A')}
+    - Market Cap: ${details.get('marketCap', 'N/A'):,.2f}
+    - Exchange: {details.get('exchange', 'N/A')}
+
+    Current Quote:
+    - Close: ${quote.close:.2f}
+    - High: ${quote.high:.2f}
+    - Low: ${quote.low:.2f}
+    - Open: ${quote.open:.2f}
+    - Volume: {quote.volume:,}
+
+    Historical Data (Last 5 days):
+    {historical_data.tail().to_string()}
+
+    Option Greeks:
+    - Delta: {greeks['delta']:.4f}
+    - Gamma: {greeks['gamma']:.4f}
+    - Theta: {greeks['theta']:.4f}
+    - Vega: {greeks['vega']:.4f}
+
+    Please provide a concise analysis of this stock, including:
+    1. An overview of the company's current market position
+    2. Recent price trends and potential factors influencing them
+    3. Options market sentiment based on the Greeks
+    4. Any notable risks or opportunities for investors
+
+    Limit your response to 250 words.
+    """
+    return prompt
+
+# Function to get current quote
+def get_current_quote(symbol):
     try:
         aggs = list(client.get_previous_close_agg(symbol))
         if aggs:
@@ -84,7 +177,8 @@ def get_current_quote(symbol, client):
         st.error(f"Error fetching current quote: {str(e)}")
         return None
 
-def get_historical_data(symbol, from_date, to_date, timeframe, client):
+# Updated function to get historical data with timeframe
+def get_historical_data(symbol, from_date, to_date, timeframe):
     try:
         if timeframe == "1 Day":
             multiplier, span = 1, "day"
@@ -120,6 +214,25 @@ def get_historical_data(symbol, from_date, to_date, timeframe, client):
         st.error(f"Error fetching historical data: {str(e)}")
         return None
 
+def get_chatgpt_analysis(prompt):
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that provides stock market analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=300,
+            n=1,
+            stop=None,
+            temperature=0.7,
+        )
+        return response.choices[0].message['content'].strip()
+    except Exception as e:
+        logging.error(f"Error getting ChatGPT analysis: {e}")
+        return None
+
+# Function to create a candlestick chart using Plotly
 def create_candlestick_chart(df, symbol):
     fig = go.Figure(data=[go.Candlestick(x=df['date'],
                     open=df['open'],
@@ -131,114 +244,51 @@ def create_candlestick_chart(df, symbol):
                       yaxis_title='Price')
     return fig
 
-def get_ai_analysis(stock_data):
-    prompt = f"Analyze the following stock data for {stock_data['symbol']}:\n"
-    prompt += f"Current Price: ${stock_data['current_price']}\n"
-    prompt += f"52-Week High: ${stock_data['52_week_high']}\n"
-    prompt += f"52-Week Low: ${stock_data['52_week_low']}\n"
-    prompt += f"P/E Ratio: {stock_data['pe_ratio']}\n"
-    prompt += "Provide a brief analysis and limited advice based on this data."
+# Function to format and display table data
+def display_formatted_table(data, title):
+    st.subheader(title)
+    df = pd.DataFrame(data, index=[0])
+    st.table(df.style.format("{:.2f}"))
 
-    try:
-        completion = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Error getting AI analysis: {e}")
-        return "Unable to generate AI analysis at this time."
+# Function to add tooltips
+def add_tooltip(text, tooltip):
+    return f"<span title='{tooltip}'>{text}</span>"
 
-# Streamlit app
-st.set_page_config(page_title="Stock Analysis App", layout="wide")
-
-st.title("Stock Analysis Application")
-
-# Sidebar for general settings
-with st.sidebar:
-    st.header("Settings")
-    
-    date_range = st.radio(
-        "Select Date Range",
-        ["1 Day", "3 Days", "1 Month", "3 Months", "1 Year"]
-    )
-
-    timeframe = st.selectbox(
-        "Select Timeframe for Graph",
-        ["1 Minute", "5 Minutes", "15 Minutes", "30 Minutes", "1 Hour", "1 Day"]
-    )
-
-    end_date = datetime.now()
-    if date_range == "1 Day":
-        start_date = end_date - timedelta(days=1)
-    elif date_range == "3 Days":
-        start_date = end_date - timedelta(days=3)
-    elif date_range == "1 Month":
-        start_date = end_date - timedelta(days=30)
-    elif date_range == "3 Months":
-        start_date = end_date - timedelta(days=90)
-    else:  # 1 Year
-        start_date = end_date - timedelta(days=365)
-
-# Main content area
-st.subheader("Stock Search and Analysis")
-query = st.text_input("Enter company name or stock symbol")
-
+# Main analysis section with tabs
 if st.button("Analyze Stock"):
-    polygon_api_key = os.getenv('POLYGON_API_KEY')
-    if not polygon_api_key or not query.strip():
-        st.error("Please ensure the Polygon API Key is set in the environment variables and enter a company name or stock symbol.")
+    if not polygon_api_key.strip() or not symbol.strip():
+        st.error("Please add your Polygon API Key and enter a stock symbol.")
     else:
         with st.spinner("Analyzing stock data..."):
             try:
-                symbol = search_stock_symbol(query)
-                if not symbol:
-                    st.error(f"Could not find symbol for {query}")
-                else:
-                    st.success(f"Analyzing symbol: {symbol}")
-
-                    # Initialize Polygon client
-                    client = RESTClient(polygon_api_key)
-
-                    # Display all data sections
-                    col1, col2 = st.columns(2)
-
-                    with col1:
+                tab1, tab2, tab3, tab4 = st.tabs(["Stock Details", "Current Quote", "Historical Data", "Option Greeks"])
+                
+                with tab1:
+                    details = get_stock_details(symbol)
+                    if details:
                         st.subheader("Stock Details")
-                        details = get_stock_details(symbol)
-                        if details:
-                            st.write(f"Ticker: {details.get('symbol', 'N/A')}")
-                            st.write(f"Name: {details.get('longName', 'N/A')}")
-                            st.write(f"Market Cap: ${details.get('marketCap', 'N/A'):,.2f}")
-                            st.write(f"Exchange: {details.get('exchange', 'N/A')}")
+                        st.write(add_tooltip(f"Ticker: {details.get('symbol', 'N/A')}", "The stock's unique identifier"))
+                        st.write(add_tooltip(f"Name: {details.get('longName', 'N/A')}", "The full name of the company"))
+                        st.write(add_tooltip(f"Market Cap: ${details.get('marketCap', 'N/A'):,.2f}", "Total value of all outstanding shares"))
+                        st.write(add_tooltip(f"Exchange: {details.get('exchange', 'N/A')}", "The stock exchange where the stock is traded"))
 
-                        st.subheader("Current Quote")
-                        quote = get_current_quote(symbol, client)
-                        if quote:
-                            st.write(f"Close: ${quote.close:.2f}")
-                            st.write(f"High: ${quote.high:.2f}")
-                            st.write(f"Low: ${quote.low:.2f}")
-                            st.write(f"Open: ${quote.open:.2f}")
-                            st.write(f"Volume: {quote.volume:,}")
+                with tab2:
+                    quote = get_current_quote(symbol)
+                    if quote:
+                        display_formatted_table({
+                            "Close": quote.close,
+                            "High": quote.high,
+                            "Low": quote.low,
+                            "Open": quote.open,
+                            "Volume": quote.volume
+                        }, "Latest Quote")
 
-                    with col2:
-                        st.subheader("Option Greeks")
-                        greeks = get_option_greeks(symbol)
-                        if greeks:
-                            st.write(f"Delta: {greeks['delta']:.4f}")
-                            st.write(f"Gamma: {greeks['gamma']:.4f}")
-                            st.write(f"Theta: {greeks['theta']:.4f}")
-                            st.write(f"Vega: {greeks['vega']:.4f}")
-                            st.info("Note: These are simplified calculations and may not reflect real-time market values.")
-                        else:
-                            st.warning("Option Greeks are not available for this stock.")
-
-                    st.subheader("Historical Data Analysis")
-                    historical_data = get_historical_data(symbol, start_date, end_date, timeframe, client)
+                with tab3:
+                    historical_data = get_historical_data(symbol, start_date, end_date, timeframe)
                     if historical_data is not None and not historical_data.empty:
-                        # Line chart
+                        st.subheader("Historical Data Analysis")
+
+                        # Line chart with adjusted y-axis
                         fig = go.Figure()
                         fig.add_trace(go.Scatter(x=historical_data['date'], y=historical_data['close'], mode='lines', name='Close Price'))
                         fig.update_layout(title=f'{symbol} Price Chart', xaxis_title='Date', yaxis_title='Price')
@@ -262,21 +312,30 @@ if st.button("Analyze Stock"):
                             mime="text/csv",
                         )
 
-                    # AI Analysis
-                    st.subheader("AI Analysis")
-                    if st.button("Get AI Analysis"):
-                        stock_data = {
-                            'symbol': symbol,
-                            'current_price': quote.close if quote else 'N/A',
-                            '52_week_high': details.get('fiftyTwoWeekHigh', 'N/A'),
-                            '52_week_low': details.get('fiftyTwoWeekLow', 'N/A'),
-                            'pe_ratio': details.get('trailingPE', 'N/A'),
-                        }
-                        ai_analysis = get_ai_analysis(stock_data)
-                        st.write(ai_analysis)
+                with tab4:
+                    greeks = get_option_greeks(symbol)
+                    if greeks:
+                        display_formatted_table(greeks, "Option Greeks")
+                        st.info("Note: These are simplified calculations and may not reflect real-time market values.")
+                    else:
+                        st.warning("Option Greeks are not available for this stock.")
+
+                # New tab for AI-driven insights
+                tab5 = st.tabs(["AI Insights"])[0]
+                with tab5:
+                    st.subheader("AI-Driven Stock Analysis")
+                    if details and quote and historical_data is not None and greeks:
+                        prompt = format_stock_data_for_chatgpt(symbol, details, quote, historical_data, greeks)
+                        ai_analysis = get_chatgpt_analysis(prompt)
+                        if ai_analysis:
+                            st.write(ai_analysis)
+                        else:
+                            st.warning("Unable to generate AI-driven insights at this time.")
+                    else:
+                        st.warning("Insufficient data to generate AI-driven insights.")
 
             except Exception as e:
                 logging.error(f"Unexpected error during stock analysis: {e}")
                 st.error(f"An unexpected error occurred: {str(e)}")
 
-st.sidebar.info("This app uses data from Polygon.io and yfinance. Please ensure you comply with their terms of service.")
+st.sidebar.info("This app uses data from Polygon.io, yfinance, and OpenAI. Please ensure you comply with their terms of service.")
