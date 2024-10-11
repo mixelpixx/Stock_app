@@ -1,9 +1,10 @@
 import os
 import streamlit as st
 import pandas as pd
-from polygon import RESTClient
+from polygon import RESTClient, exceptions as polygon_exceptions
 import yfinance as yf
 from py_vollib.black_scholes import black_scholes
+from py_vollib.black_scholes.greeks.analytical import delta, gamma, vega, theta
 from datetime import datetime, timedelta
 import logging
 import plotly.graph_objects as go
@@ -15,8 +16,7 @@ logging.basicConfig(filename='stock_app_error.log', level=logging.ERROR,
 def search_stock_symbol(company_name):
     try:
         ticker = yf.Ticker(company_name)
-        info = ticker.info
-        return info.get('symbol', None)
+        return ticker.ticker
     except Exception as e:
         logging.error(f"Error searching stock symbol: {e}")
         return None
@@ -79,12 +79,15 @@ client = RESTClient(polygon_api_key)
 # Function to get stock details
 def get_stock_details(symbol):
     try:
-        details = client.get_ticker_details(symbol)
-        if details:
-            return details
-        else:
-            st.warning(f"No details found for symbol: {symbol}")
-            return None
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        if info:
+            return info
+        st.warning(f"No details found for symbol: {symbol}")
+        return None
+    except polygon_exceptions.NoResultsError:
+        st.warning(f"No details found for symbol: {symbol}")
+        return None
     except Exception as e:
         logging.error(f"Error fetching stock details: {e}")
         st.error(f"Error fetching stock details: {str(e)}")
@@ -102,12 +105,17 @@ def get_option_greeks(symbol):
             call = option_chain.calls.iloc[0]
             
             # Calculate Greeks (simplified)
-            delta = black_scholes('c', current_price, call['strike'], 30/365, 0.01, call['impliedVolatility'], 'delta')
-            gamma = black_scholes('c', current_price, call['strike'], 30/365, 0.01, call['impliedVolatility'], 'gamma')
-            theta = black_scholes('c', current_price, call['strike'], 30/365, 0.01, call['impliedVolatility'], 'theta')
-            vega = black_scholes('c', current_price, call['strike'], 30/365, 0.01, call['impliedVolatility'], 'vega')
+            S = current_price
+            K = call['strike']
+            T = 30/365
+            r = 0.01
+            sigma = call['impliedVolatility']
+            delta_value = delta('c', S, K, T, r, sigma)
+            gamma_value = gamma('c', S, K, T, r, sigma)
+            theta_value = theta('c', S, K, T, r, sigma)
+            vega_value = vega('c', S, K, T, r, sigma)
             
-            return {'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega}
+            return {'delta': delta_value, 'gamma': gamma_value, 'theta': theta_value, 'vega': vega_value}
     except Exception as e:
         logging.error(f"Error fetching option Greeks: {e}")
         return None
@@ -198,10 +206,10 @@ if st.button("Analyze Stock"):
                     details = get_stock_details(symbol)
                     if details:
                         st.subheader("Stock Details")
-                        st.write(add_tooltip(f"Ticker: {details.ticker}", "The stock's unique identifier"))
-                        st.write(add_tooltip(f"Name: {details.name}", "The full name of the company"))
-                        st.write(add_tooltip(f"Market Cap: ${details.market_cap:,.2f}", "Total value of all outstanding shares"))
-                        st.write(add_tooltip(f"Primary Exchange: {details.primary_exchange}", "The main stock exchange where the stock is traded"))
+                        st.write(add_tooltip(f"Ticker: {details.get('symbol', 'N/A')}", "The stock's unique identifier"))
+                        st.write(add_tooltip(f"Name: {details.get('longName', 'N/A')}", "The full name of the company"))
+                        st.write(add_tooltip(f"Market Cap: ${details.get('marketCap', 'N/A'):,.2f}", "Total value of all outstanding shares"))
+                        st.write(add_tooltip(f"Exchange: {details.get('exchange', 'N/A')}", "The stock exchange where the stock is traded"))
 
                 with tab2:
                     quote = get_current_quote(symbol)
